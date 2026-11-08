@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from pathlib import Path
 from sklearn.feature_extraction.text import CountVectorizer
-from gemini_insights import generate_customer_insights
+from gemini_insights import generate_customer_insights, classify_reviews_with_gemini
 
 st.set_page_config(
     page_title="Customer Feedback Insights",
@@ -48,9 +48,234 @@ if not Path(DATA_PATH).exists() or not Path(MODEL_PATH).exists():
     st.error("Dataset or trained model not found. Check your project files.")
     st.stop()
 
+
+
 with st.spinner("Loading reviews and model..."):
     model = load_model()
     reviews = load_reviews()
+
+# Upload and analyze a separate CSV without changing the historical dashboard.
+st.header("0. Upload New Customer Reviews")
+st.write(
+    "Upload a CSV containing review text to analyze new feedback with the trained "
+    "sentiment model. Your historical dashboard below remains based on the saved dataset."
+)
+uploaded_file = st.file_uploader(
+    "Choose a customer reviews CSV file",
+    type=["csv"],
+    help="The file should contain a review text column such as Text, ReviewText, Review, or content."
+)
+
+if uploaded_file is not None:
+    try:
+        uploaded_df = pd.read_csv(uploaded_file)
+        if uploaded_df.empty:
+            st.warning("The uploaded CSV has no rows.")
+        else:
+            # Find a usable review-text column, or combine Summary + Text.
+            lower_columns = {str(c).strip().lower(): c for c in uploaded_df.columns}
+            text_col = next(
+                (lower_columns[name] for name in
+                 ["reviewtext", "review_text", "text", "review", "content", "body"]
+                 if name in lower_columns),
+                None
+            )
+            summary_col = lower_columns.get("summary")
+            if text_col is None and summary_col is not None and "text" in lower_columns:
+                uploaded_df["__combined_review_text"] = (
+                    uploaded_df[summary_col].fillna("").astype(str).str.strip()
+                    + " "
+                    + uploaded_df[lower_columns["text"]].fillna("").astype(str).str.strip()
+                ).str.strip()
+                text_col = "__combined_review_text"
+
+            if text_col is None:
+                st.error(
+                    "I couldn't find a review text column. Please include a column named "
+                    "Text, ReviewText, Review, content, or body (optionally with Summary)."
+                )
+            else:
+                uploaded_df["ReviewText"] = uploaded_df[text_col].fillna("").astype(str).str.strip()
+                uploaded_df = uploaded_df[uploaded_df["ReviewText"].ne("")].copy()
+
+                if uploaded_df.empty:
+                    st.warning("No non-empty review text was found in this CSV.")
+                else:
+                    st.caption(f"Loaded {len(uploaded_df):,} reviews from the uploaded CSV.")
+                    if st.button("Analyze uploaded reviews", key="analyze_uploaded_reviews"):
+                        with st.spinner("Predicting sentiment for uploaded reviews..."):
+                            uploaded_df["ML Sentiment"] = model.predict(uploaded_df["ReviewText"])
+                            if hasattr(model, "predict_proba"):
+                                try:
+                                    probabilities = model.predict_proba(uploaded_df["ReviewText"])
+                                    classes = list(model.classes_)
+                                    uploaded_df["ML Confidence"] = [
+                                        round(float(max(row)), 4) for row in probabilities
+                                    ]
+                                except Exception:
+                                    uploaded_df["ML Confidence"] = None
+                            else:
+                                uploaded_df["ML Confidence"] = None
+
+                            issue_patterns = {
+                                "Taste & Flavor": r"\btaste\b|\bflavou?r\b|\bbland\b|\bbitter\b|\bsalty\b|\bsweet\b|\bstale\b|\baftertaste\b",
+                                "Packaging": r"\bpackag(?:e|ing|ed)\b|\bwrapper\b|\bbox\b|\bseal\b|\bcontainer\b|\bpacket\b",
+                                "Product Quality": r"\bquality\b|\bbroken\b|\bdefect(?:ive)?\b|\bnot working\b|\bdoes not work\b|\bpoorly made\b|\bmold\b|\bmould\b|\bspoiled\b|\bexpired\b",
+                                "Delivery & Shipping": r"\bdelivery\b|\bshipping\b|\bshipped\b|\blate\b|\barrived\b|\bcourier\b|\bmissing order\b",
+                                "Price & Value": r"\bprice\b|\bexpensive\b|\bcost\b|\boverpriced\b|\bvalue\b|\bworth\b|\bcheap\b",
+                                "Ingredients & Safety": r"\bingredients?\b|\ballergy\b|\ballergic\b|\bunsafe\b|\bcontaminat(?:ed|ion)\b|\bchemical\b"
+                            }
+
+                            def uploaded_categories(review):
+                                matches = [
+                                    category for category, pattern in issue_patterns.items()
+                                    if re.search(pattern, str(review).lower())
+                                ]
+                                return ", ".join(matches) if matches else "Other / General"
+
+                            def uploaded_explanation(row):
+                                sentiment = str(row["ML Sentiment"])
+                                categories = row["Issue Category"]
+                                if sentiment == "Negative":
+                                    return (
+                                        "The trained model classified this review as negative. "
+                                        f"Matched issue keywords: {categories}. Check the review text to verify."
+                                    )
+                                if sentiment == "Positive":
+                                    return (
+                                        "The trained model classified this review as positive. "
+                                        "This is a model prediction, so verify it against the review text."
+                                    )
+                                return (
+                                    "The trained model classified this review as neutral. "
+                                    "Neutral sentiment can be harder to classify; check the original text."
+                                )
+
+                            uploaded_df["Issue Category"] = uploaded_df["ReviewText"].apply(uploaded_categories)
+                            uploaded_df["ML Explanation"] = uploaded_df.apply(uploaded_explanation, axis=1)
+                            uploaded_df["LLM Sentiment"] = "Not evaluated yet"
+                            uploaded_df["LLM Explanation"] = "Click the Gemini comparison button below to evaluate this review."
+                            uploaded_df["ML vs LLM"] = "Not compared yet"
+
+                        st.session_state["uploaded_review_results"] = uploaded_df
+                        st.success("Uploaded reviews analyzed.")
+
+                    results = st.session_state.get("uploaded_review_results")
+                    if results is not None:
+                        st.subheader("Detailed Review Analysis")
+                        st.caption(
+                            "Each row shows the ML sentiment, keyword-based issue category, and an explanation. "
+                            "Gemini sentiment predictions are run separately when you click the comparison button."
+                        )
+                        if st.button(
+                            "Run Gemini sentiment predictions and compare",
+                            key="run_gemini_row_comparison"
+                        ):
+                            with st.spinner("Gemini is classifying uploaded reviews in small batches..."):
+                                try:
+                                    llm_results = classify_reviews_with_gemini(
+                                        results["ReviewText"].astype(str).tolist(),
+                                        batch_size=25
+                                    )
+                                    results["LLM Sentiment"] = [x.get("sentiment", "Unknown") for x in llm_results]
+                                    results["LLM Explanation"] = [x.get("explanation", "") for x in llm_results]
+                                    results["ML vs LLM"] = results.apply(
+                                        lambda row: "DIFFERENT — review manually" if
+                                        row["ML Sentiment"] != row["LLM Sentiment"] and
+                                        row["LLM Sentiment"] in ["Positive", "Negative", "Neutral"]
+                                        else ("AGREE" if row["ML Sentiment"] == row["LLM Sentiment"] else "Not compared"),
+                                        axis=1
+                                    )
+                                    st.session_state["uploaded_review_results"] = results
+                                    st.success("Gemini predictions completed for uploaded reviews.")
+                                except Exception as exc:
+                                    st.error(
+                                        "Gemini could not classify the reviews. Check GEMINI_API_KEY and internet access. "
+                                        f"Details: {exc}"
+                                    )
+                        results = st.session_state.get("uploaded_review_results", results)
+                        if "ML vs LLM" in results.columns and results["ML vs LLM"].isin(["AGREE", "DIFFERENT — review manually"]).any():
+                            comparison_counts = results["ML vs LLM"].value_counts()
+                            ca, cb = st.columns(2)
+                            ca.metric("ML and Gemini agree", int(comparison_counts.get("AGREE", 0)))
+                            cb.metric("Predictions differ", int(comparison_counts.get("DIFFERENT — review manually", 0)))
+                            st.subheader("ML vs Gemini Comparison")
+                            st.dataframe(
+                                results[results["ML vs LLM"] == "DIFFERENT — review manually"]
+                                [["ReviewText", "ML Sentiment", "LLM Sentiment", "LLM Explanation", "ML vs LLM"]],
+                                use_container_width=True,
+                                hide_index=True
+                            )
+                        st.subheader("Uploaded Review Analysis")
+                        total_uploaded = len(results)
+                        counts_uploaded = results["ML Sentiment"].value_counts()
+                        metric_cols = st.columns(4)
+                        metric_cols[0].metric("Total reviews", f"{total_uploaded:,}")
+                        for i, sentiment in enumerate(["Positive", "Negative", "Neutral"], start=1):
+                            metric_cols[i].metric(sentiment, f"{counts_uploaded.get(sentiment, 0):,}")
+
+                        st.bar_chart(counts_uploaded)
+                        st.dataframe(
+                            results,
+                            use_container_width=True,
+                            hide_index=True
+                        )
+                        st.download_button(
+                            "Download uploaded review analysis (CSV)",
+                            data=results.to_csv(index=False).encode("utf-8"),
+                            file_name="uploaded_customer_feedback_analysis.csv",
+                            mime="text/csv",
+                            key="download_uploaded_analysis"
+                        )
+                        report_lines = [
+                            "CUSTOMER FEEDBACK MANAGEMENT REPORT",
+                            "",
+                            f"Total uploaded reviews: {len(results)}",
+                            "ML sentiment counts:",
+                            results["ML Sentiment"].value_counts().to_string(),
+                            "",
+                            "Most frequent issue categories:",
+                            results["Issue Category"].value_counts().head(10).to_string(),
+                        ]
+                        if "ML vs LLM" in results.columns and results["ML vs LLM"].isin(["AGREE", "DIFFERENT — review manually"]).any():
+                            report_lines.extend([
+                                "",
+                                "ML vs Gemini comparison:",
+                                results["ML vs LLM"].value_counts().to_string(),
+                                "",
+                                "Reviews where predictions differ (review manually):",
+                                results.loc[results["ML vs LLM"] == "DIFFERENT — review manually", ["ReviewText", "ML Sentiment", "LLM Sentiment", "LLM Explanation"]].to_string(index=False),
+                            ])
+                        st.download_button(
+                            "Download management report (TXT)",
+                            data="\n".join(report_lines).encode("utf-8"),
+                            file_name="customer_feedback_management_report.txt",
+                            mime="text/plain",
+                            key="download_management_report"
+                        )
+
+                        st.subheader("Gemini Summary for Uploaded Reviews")
+                        st.caption(
+                            "This asks Gemini to summarize a small sample of uploaded reviews. "
+                            "It does not create a separate LLM sentiment prediction for every row."
+                        )
+                        if st.button("Generate Gemini summary for uploaded reviews",
+                                     key="gemini_uploaded_summary"):
+                            sample_reviews = [
+                                str(x).strip() for x in results["ReviewText"].head(20).tolist()
+                                if str(x).strip()
+                            ]
+                            with st.spinner("Gemini is reviewing a sample of uploaded feedback..."):
+                                try:
+                                    st.markdown(generate_customer_insights(sample_reviews))
+                                except Exception as exc:
+                                    st.error(
+                                        "Gemini could not generate a summary. Check the API key, "
+                                        "internet connection, and Gemini configuration. "
+                                        f"Details: {exc}"
+                                    )
+    except Exception as exc:
+        st.error(f"Could not read this CSV. Please check that it is a valid CSV file. Details: {exc}")
 
 with st.spinner("Analyzing customer feedback..."):
     if "PredictedSentiment" not in reviews.columns:
@@ -110,106 +335,86 @@ negative = reviews[
 
 if not negative.empty:
 
-    st.subheader("Common two-word phrases in negative reviews")
+    st.subheader("Negative Reviews by Issue Category")
 
-    try:
-        vectorizer = CountVectorizer(
-            stop_words="english",
-            ngram_range=(2, 2),
-            max_features=1000,
-            min_df=3,
-            token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b"
-        )
-
-        phrase_matrix = vectorizer.fit_transform(
-            negative["ReviewText"].fillna("")
-        )
-
-        phrase_counts = phrase_matrix.sum(axis=0).A1
-        phrases = vectorizer.get_feature_names_out()
-
-        excluded_terms = {
-            "br br", "nbsp nbsp", "amp amp", "quot quot",
-            "lt lt", "gt gt", "http http", "www www"
-        }
-
-        valid_indices = [
-            i for i, phrase in enumerate(phrases)
-            if phrase not in excluded_terms
-            and not any(
-                artifact in phrase.split()
-                for artifact in ["nbsp", "quot", "amp", "http", "https", "www"]
-            )
-        ]
-
-        common_phrases = (
-            pd.DataFrame({
-                "Phrase": phrases[valid_indices],
-                "Occurrences": phrase_counts[valid_indices]
-            })
-            .sort_values("Occurrences", ascending=False)
-            .head(15)
-        )
-
-        if not common_phrases.empty:
-            st.bar_chart(common_phrases.set_index("Phrase"))
-        else:
-            st.info("No useful repeated phrases were found.")
-
-        st.caption(
-            "Frequent phrases are clues to possible issues, not confirmed "
-            "issue categories. Inspect supporting reviews before drawing conclusions."
-        )
-
-    except ValueError:
-        st.info("Not enough repeated phrases were found in this sample.")
-
-    st.subheader("Frequent individual words in negative reviews")
-
-    stopwords = {
-        "the", "and", "for", "was", "this", "that", "with", "but",
-        "have", "had", "not", "you", "are", "very", "too", "from",
-        "they", "its", "it", "is", "of", "to", "in", "a", "an",
-        "on", "my", "as", "be", "at", "or", "so", "if", "were",
-        "product", "one", "would", "could", "get", "just", "when",
-        "all", "out", "up", "me", "we", "our", "no", "than",
-        "nbsp", "amp", "quot", "http", "https", "www"
+    # These keyword rules group reviews into understandable issue categories.
+    # A review can match more than one category.
+    category_patterns = {
+        "Taste & Flavor": r"\btaste\b|\bflavou?r\b|\bbland\b|\bbitter\b|\bsalty\b|\bsweet\b|\bstale\b|\baftertaste\b",
+        "Packaging": r"\bpackag(?:e|ing|ed)\b|\bwrapper\b|\bbox\b|\bseal\b|\bcontainer\b|\bpacket\b",
+        "Product Quality": r"\bquality\b|\bbroken\b|\bdefect(?:ive)?\b|\bnot working\b|\bdoes not work\b|\bpoorly made\b|\bmold\b|\bmould\b|\bspoiled\b|\bexpired\b",
+        "Delivery & Shipping": r"\bdelivery\b|\bshipping\b|\bshipped\b|\blate\b|\barrived\b|\bcourier\b|\bmissing order\b",
+        "Price & Value": r"\bprice\b|\bexpensive\b|\bcost\b|\boverpriced\b|\bvalue\b|\bworth\b|\bcheap\b",
+        "Ingredients & Safety": r"\bingredients?\b|\ballergy\b|\ballergic\b|\bunsafe\b|\bcontaminat(?:ed|ion)\b|\bchemical\b"
     }
 
-    def extract_words(text):
-        words = re.findall(r"[a-zA-Z]{3,}", str(text).lower())
-        return [word for word in words if word not in stopwords]
+    negative["ReviewText"] = negative["ReviewText"].fillna("").astype(str)
 
-    word_counts = Counter()
+    def find_issue_categories(review_text):
+        text = str(review_text).lower()
+        matches = [
+            category for category, pattern in category_patterns.items()
+            if re.search(pattern, text)
+        ]
+        return matches if matches else ["Other / General"]
 
-    for review_text in negative["ReviewText"]:
-        word_counts.update(extract_words(review_text))
-
-    common_words = pd.DataFrame(
-        word_counts.most_common(15),
-        columns=["Word", "Occurrences"]
+    negative["IssueCategories"] = negative["ReviewText"].apply(
+        find_issue_categories
     )
 
-    if not common_words.empty:
-        st.bar_chart(common_words.set_index("Word"))
+    category_rows = [
+        {"Issue category": category, "Matching reviews": len(negative[
+            negative["IssueCategories"].apply(lambda items: category in items)
+        ])}
+        for category in category_patterns
+    ]
+    other_count = int(
+        negative["IssueCategories"].apply(
+            lambda items: items == ["Other / General"]
+        ).sum()
+    )
+    category_rows.append({
+        "Issue category": "Other / General",
+        "Matching reviews": other_count
+    })
+    category_counts = pd.DataFrame(category_rows).sort_values(
+        "Matching reviews", ascending=False
+    )
 
-    st.subheader("Supporting negative reviews")
+    st.caption(
+        "Categories are suggested by matching keywords in negative reviews. "
+        "A review can appear in more than one category, so category counts may overlap. "
+        "Inspect the supporting reviews before drawing conclusions."
+    )
+    st.bar_chart(category_counts.set_index("Issue category"))
+
+    st.subheader("Supporting Negative Reviews by Category")
+    selected_category = st.selectbox(
+        "Choose an issue category",
+        category_counts["Issue category"].tolist(),
+        key="negative_issue_category"
+    )
+
+    evidence = negative[
+        negative["IssueCategories"].apply(
+            lambda items: selected_category in items
+        )
+    ].copy()
 
     query = st.text_input(
-        "Filter negative reviews by keyword",
-        placeholder="e.g. taste, packaging, quality"
+        "Search within supporting reviews (optional)",
+        placeholder="e.g. damaged, bitter, expensive",
+        key="category_review_search"
     )
-
-    evidence = negative.copy()
 
     if query.strip():
         evidence = evidence[
             evidence["ReviewText"].str.contains(
-                query, case=False, na=False, regex=False
+                query.strip(), case=False, na=False, regex=False
             )
         ]
 
-    st.write(f"Matching reviews: {len(evidence):,}")
+    st.write(f"Category: **{selected_category}** · Matching reviews: **{len(evidence):,}**")
 
     st.dataframe(
         evidence[["ReviewDate", "Score", "ReviewText"]].head(100),
@@ -217,12 +422,13 @@ if not negative.empty:
     )
 
     if not evidence.empty:
-        csv_data = evidence.to_csv(index=False).encode("utf-8")
-
+        csv_data = evidence.drop(columns=["IssueCategories"]).to_csv(
+            index=False
+        ).encode("utf-8")
         st.download_button(
-            "Download supporting reviews (CSV)",
+            "Download supporting reviews for this category (CSV)",
             data=csv_data,
-            file_name="supporting_negative_reviews.csv",
+            file_name="supporting_reviews_by_category.csv",
             mime="text/csv"
         )
 
