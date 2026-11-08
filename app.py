@@ -388,6 +388,30 @@ if not negative.empty:
     )
     st.bar_chart(category_counts.set_index("Issue category"))
 
+    st.subheader("Emerging Issues Detection")
+    dated = negative.dropna(subset=["ReviewDate"]).copy()
+    dated["Month"] = dated["ReviewDate"].dt.to_period("M")
+    monthly_issues = dated.explode("IssueCategories")
+    monthly_issues = pd.crosstab(monthly_issues["Month"], monthly_issues["IssueCategories"]).sort_index()
+
+    if len(monthly_issues) >= 2:
+        previous = monthly_issues.iloc[-2]
+        latest = monthly_issues.iloc[-1]
+        emerging = []
+        for category in monthly_issues.columns:
+            old = int(previous.get(category, 0))
+            new = int(latest.get(category, 0))
+            if new >= 3 and new - old >= 3 and new >= old * 1.5:
+                change = "New issue" if old == 0 else f"{(new-old)/old*100:.0f}% increase"
+                emerging.append({"Issue": category, "Previous month": old, "Latest month": new, "Change": change})
+        st.caption(f"Comparing {monthly_issues.index[-2]} with {monthly_issues.index[-1]}. Potential signals need manual review.")
+        if emerging:
+            st.dataframe(pd.DataFrame(emerging), use_container_width=True, hide_index=True)
+        else:
+            st.info("No issues met the emerging-issue threshold in this comparison.")
+    else:
+        st.info("Not enough monthly data to compare emerging issues.")
+
     st.subheader("Supporting Negative Reviews by Category")
     selected_category = st.selectbox(
         "Choose an issue category",
