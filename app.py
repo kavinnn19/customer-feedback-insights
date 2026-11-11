@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import altair as alt
 import joblib
 import re
 from collections import Counter
@@ -53,6 +54,29 @@ if not Path(DATA_PATH).exists() or not Path(MODEL_PATH).exists():
 with st.spinner("Loading reviews and model..."):
     model = load_model()
     reviews = load_reviews()
+
+def show_sentiment_chart(sentiment_counts):
+    """Display sentiment counts with consistent positive/negative/neutral colours."""
+    chart_df = sentiment_counts.rename_axis("Sentiment").reset_index(name="Reviews")
+    sentiment_order = ["Positive", "Negative", "Neutral"]
+    chart_df["Sentiment"] = pd.Categorical(
+        chart_df["Sentiment"], categories=sentiment_order, ordered=True
+    )
+    chart = alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X("Sentiment:N", sort=sentiment_order, title=None),
+        y=alt.Y("Reviews:Q", title="Number of reviews"),
+        color=alt.Color(
+            "Sentiment:N",
+            scale=alt.Scale(
+                domain=sentiment_order,
+                range=["#16a34a", "#dc2626", "#eab308"],
+            ),
+            legend=None,
+        ),
+        tooltip=["Sentiment:N", "Reviews:Q"],
+    )
+    st.altair_chart(chart, use_container_width=True)
+
 
 # Upload and analyze a separate CSV without changing the historical dashboard.
 st.header("0. Upload New Customer Reviews")
@@ -174,8 +198,7 @@ if uploaded_file is not None:
                             with st.spinner("Gemini is classifying uploaded reviews in small batches..."):
                                 try:
                                     llm_results = classify_reviews_with_gemini(
-                                        results["ReviewText"].astype(str).tolist(),
-                                        batch_size=25
+                                        results["ReviewText"].astype(str).tolist()
                                     )
                                     results["LLM Sentiment"] = [x.get("sentiment", "Unknown") for x in llm_results]
                                     results["LLM Explanation"] = [x.get("explanation", "") for x in llm_results]
@@ -214,9 +237,36 @@ if uploaded_file is not None:
                         for i, sentiment in enumerate(["Positive", "Negative", "Neutral"], start=1):
                             metric_cols[i].metric(sentiment, f"{counts_uploaded.get(sentiment, 0):,}")
 
-                        st.bar_chart(counts_uploaded)
+                        show_sentiment_chart(counts_uploaded)
+                        st.caption(
+                            "Colour guide: 🟩 Positive = good feedback | "
+                            "🟥 Negative = complaints | "
+                            "🟨 Neutral = neither clearly positive nor negative."
+                        )
+
+                        def colour_sentiment(value):
+                            colours = {
+                                "Positive": "background-color: #dcfce7; color: #166534; font-weight: bold",
+                                "Negative": "background-color: #fee2e2; color: #991b1b; font-weight: bold",
+                                "Neutral": "background-color: #fef3c7; color: #92400e; font-weight: bold",
+                            }
+                            return colours.get(value, "")
+
+                        sentiment_columns = [
+                            col for col in ["ML Sentiment", "LLM Sentiment"]
+                            if col in results.columns
+                        ]
+                        # Put sentiment columns first so the colour-coded results are
+                        # immediately visible without horizontal scrolling.
+                        remaining_columns = [
+                            col for col in results.columns if col not in sentiment_columns
+                        ]
+                        display_results = results[sentiment_columns + remaining_columns].copy()
+                        styled_results = display_results.style.applymap(
+                            colour_sentiment, subset=sentiment_columns
+                        )
                         st.dataframe(
-                            results,
+                            styled_results,
                             use_container_width=True,
                             hide_index=True
                         )
@@ -311,7 +361,7 @@ left, right = st.columns(2)
 
 with left:
     st.subheader("Sentiment distribution")
-    st.bar_chart(counts)
+    show_sentiment_chart(counts)
 
 with right:
     st.subheader("Sentiment over time")
@@ -389,26 +439,35 @@ if not negative.empty:
     st.bar_chart(category_counts.set_index("Issue category"))
 
     st.subheader("Emerging Issues Detection")
-    dated = negative.dropna(subset=["ReviewDate"]).copy()
-    dated["Month"] = dated["ReviewDate"].dt.to_period("M")
-    monthly_issues = dated.explode("IssueCategories")
-    monthly_issues = pd.crosstab(monthly_issues["Month"], monthly_issues["IssueCategories"]).sort_index()
-
-    if len(monthly_issues) >= 2:
-        previous = monthly_issues.iloc[-2]
-        latest = monthly_issues.iloc[-1]
-        emerging = []
-        for category in monthly_issues.columns:
-            old = int(previous.get(category, 0))
-            new = int(latest.get(category, 0))
-            if new >= 3 and new - old >= 3 and new >= old * 1.5:
-                change = "New issue" if old == 0 else f"{(new-old)/old*100:.0f}% increase"
-                emerging.append({"Issue": category, "Previous month": old, "Latest month": new, "Change": change})
-        st.caption(f"Comparing {monthly_issues.index[-2]} with {monthly_issues.index[-1]}. Potential signals need manual review.")
-        if emerging:
-            st.dataframe(pd.DataFrame(emerging), use_container_width=True, hide_index=True)
+    monthly_negative = negative.copy()
+    monthly_negative["Month"] = monthly_negative["ReviewDate"].dt.to_period("M").astype(str)
+    available_months = sorted(monthly_negative["Month"].dropna().unique())
+    if len(available_months) >= 2:
+        previous_month, current_month = available_months[-2], available_months[-1]
+        previous_rows = monthly_negative[monthly_negative["Month"] == previous_month]
+        current_rows = monthly_negative[monthly_negative["Month"] == current_month]
+        issue_comparison = []
+        for category, pattern in category_patterns.items():
+            previous_count = int(previous_rows["ReviewText"].str.contains(pattern, case=False, regex=True, na=False).sum())
+            current_count = int(current_rows["ReviewText"].str.contains(pattern, case=False, regex=True, na=False).sum())
+            if current_count > previous_count and current_count >= 3:
+                issue_comparison.append({
+                    "Potential emerging issue": category,
+                    f"{previous_month} reviews": previous_count,
+                    f"{current_month} reviews": current_count,
+                    "Change": current_count - previous_count,
+                })
+        st.caption(
+            f"Comparing {previous_month} with {current_month}. These are potential signals based on keyword counts; manually check the reviews."
+        )
+        if issue_comparison:
+            st.dataframe(
+                pd.DataFrame(issue_comparison).sort_values("Change", ascending=False),
+                hide_index=True,
+                use_container_width=True,
+            )
         else:
-            st.info("No issues met the emerging-issue threshold in this comparison.")
+            st.info("No issue categories met the current emerging-issue threshold in this comparison.")
     else:
         st.info("Not enough monthly data to compare emerging issues.")
 
@@ -507,7 +566,43 @@ if not negative.empty:
 else:
     st.info("No negative reviews were found in this sample.")
 
-st.header("3. Model Reliability")
+# Show actual positive examples so the dashboard explains what customers liked.
+st.header("3. Positive Customer Feedback")
+positive = reviews[reviews["PredictedSentiment"] == "Positive"].copy()
+if not positive.empty:
+    st.write(
+        "This section shows examples from reviews predicted as positive. "
+        "Use the review text to understand what customers liked; these are model predictions."
+    )
+    positive_text = positive["ReviewText"].fillna("").astype(str)
+    positive_words = CountVectorizer(
+        stop_words="english", ngram_range=(1, 2), max_features=12,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b"
+    )
+    try:
+        word_matrix = positive_words.fit_transform(positive_text)
+        word_counts = word_matrix.sum(axis=0).A1
+        positive_terms = pd.DataFrame({
+            "Frequently mentioned words/phrases": positive_words.get_feature_names_out(),
+            "Count": word_counts
+        }).sort_values("Count", ascending=False).head(10)
+        st.caption(
+            "These are frequent words/phrases in positive-predicted reviews, not guaranteed themes. "
+            "Read the examples below before drawing conclusions."
+        )
+        st.dataframe(positive_terms, hide_index=True, use_container_width=True)
+    except ValueError:
+        st.info("There is not enough text to extract common positive-feedback phrases.")
+    st.subheader("Examples of positive customer feedback")
+    st.dataframe(
+        positive[["ReviewDate", "Score", "ReviewText"]].head(20),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.info("No positive reviews were found in this sample.")
+
+st.header("4. Model Reliability")
 
 st.write(
     "The model was evaluated on a separate test set of 20,000 reviews "
@@ -545,7 +640,7 @@ st.warning(
     "sentiment. Manually inspect sample predictions before relying on them."
 )
 
-st.header("4. Test New Customer Feedback")
+st.header("5. Test New Customer Feedback")
 
 new_review = st.text_area(
     "Enter a customer review",
@@ -570,7 +665,7 @@ if st.button("Analyze review"):
     else:
         st.warning("Please enter a review first.")
 
-st.header("5. Export Analysis")
+st.header("6. Export Analysis")
 
 export_df = reviews.copy()
 export_df["ReviewDate"] = export_df["ReviewDate"].astype(str)
